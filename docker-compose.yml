@@ -1,6 +1,16 @@
+# Shared build args (override via .env to route through regional mirrors,
+# e.g. DOCKER_BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+# and PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple).
+x-build-args: &build-args
+  args:
+    BASE_IMAGE: ${DOCKER_BASE_IMAGE:-python:3.12-slim}
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+
 services:
   tradingagents:
-    build: .
+    build:
+      context: .
+      <<: *build-args
     env_file:
       - .env
     volumes:
@@ -12,7 +22,9 @@ services:
   # messages, runs TradingAgents, and replies with the full report.
   # Requires JIYING_WS_URL / JIYING_APP_ID / JIYING_APP_SECRET in .env.
   jiying-agent:
-    build: .
+    build:
+      context: .
+      <<: *build-args
     entrypoint: ["python", "-m", "jiying"]
     env_file:
       - .env
@@ -28,7 +40,9 @@ services:
       - ollama
 
   tradingagents-ollama:
-    build: .
+    build:
+      context: .
+      <<: *build-args
     env_file:
       - .env
     environment:
@@ -45,7 +59,9 @@ services:
 
   # JiYing bridge variant backed by the local Ollama instance.
   jiying-agent-ollama:
-    build: .
+    build:
+      context: .
+      <<: *build-args
     entrypoint: ["python", "-m", "jiying"]
     env_file:
       - .env
