@@ -246,6 +246,23 @@ class JiyingClient:
         """Confirm reliable events up to ``cursor`` (doc 4.20)."""
         return await self.request("events.ack", {"cursor": cursor})
 
+    async def create_topic(
+        self, conversation_id: str, source_message_id: str
+    ) -> dict[str, Any]:
+        """Create (or reuse) a topic from a visible message (doc 4.8).
+
+        The response contains the topic ``conversation`` (with its own id to
+        post into), ``created`` and ``archived`` flags. Repeated calls for the
+        same source message return the same topic, so retries stay idempotent.
+        """
+        return await self.request(
+            "conversation.topic.create",
+            {
+                "conversation_id": conversation_id,
+                "source_message_id": source_message_id,
+            },
+        )
+
     async def send_status(self, conversation_id: str, status: str) -> None:
         """Best-effort typing status update; never raises (doc 4.21)."""
         try:

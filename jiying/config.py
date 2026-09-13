@@ -36,6 +36,17 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env_str(name).lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be a boolean (true/false), got {raw!r}")
+
+
 class ConfigError(ValueError):
     """Raised when required JiYing settings are missing or invalid."""
 
@@ -50,6 +61,12 @@ class JiyingConfig:
     # Report delivery
     report_chunk_chars: int = 3500
     max_report_messages: int = 12
+    # Long reports are delivered into a topic created from the user's message
+    # (doc 4.8) instead of flooding the main conversation. The main chat then
+    # only receives the headline summary plus a pointer to the topic.
+    topic_delivery: bool = True
+    topic_threshold_messages: int = 6
+    topic_max_messages: int = 40
     # Progress status heartbeat sent while an analysis is running
     status_interval_seconds: float = 3.0
     # RPC behaviour
@@ -75,6 +92,10 @@ class JiyingConfig:
             raise ConfigError("JIYING_REPORT_CHUNK_CHARS must be positive")
         if self.max_report_messages <= 0:
             raise ConfigError("JIYING_MAX_REPORT_MESSAGES must be positive")
+        if self.topic_threshold_messages <= 0:
+            raise ConfigError("JIYING_TOPIC_THRESHOLD_MESSAGES must be positive")
+        if self.topic_max_messages <= 0:
+            raise ConfigError("JIYING_TOPIC_MAX_MESSAGES must be positive")
 
     @classmethod
     def from_env(cls) -> JiyingConfig:
@@ -84,6 +105,9 @@ class JiyingConfig:
             app_secret=_env_str(_APP_SECRET),
             report_chunk_chars=_env_int("JIYING_REPORT_CHUNK_CHARS", 3500),
             max_report_messages=_env_int("JIYING_MAX_REPORT_MESSAGES", 12),
+            topic_delivery=_env_bool("JIYING_TOPIC_DELIVERY", True),
+            topic_threshold_messages=_env_int("JIYING_TOPIC_THRESHOLD_MESSAGES", 6),
+            topic_max_messages=_env_int("JIYING_TOPIC_MAX_MESSAGES", 40),
             status_interval_seconds=_env_float("JIYING_STATUS_INTERVAL_SECONDS", 3.0),
             request_timeout_seconds=_env_float("JIYING_REQUEST_TIMEOUT_SECONDS", 30.0),
             request_retries=_env_int("JIYING_REQUEST_RETRIES", 2),

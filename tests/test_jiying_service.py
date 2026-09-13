@@ -27,12 +27,16 @@ CONFIG = JiyingConfig(
 
 
 class FakeClient:
+    connected = False
+
     def __init__(self):
         self.sent: list[dict] = []
         self.acked: list[int] = []
         self.statuses: list[str] = []
+        self.topics_created: list[tuple[str, str]] = []
         self.fail_sends = False
         self.fail_ack = False
+        self.fail_create_topic = False
 
     async def send_message(
         self, target_type, conversation_id, message, *, reply_to_message_id=None
@@ -55,8 +59,31 @@ class FakeClient:
         self.acked.append(cursor)
         return {"cursor": cursor}
 
+    async def create_topic(self, conversation_id, source_message_id):
+        if self.fail_create_topic:
+            raise ConnectionError("gateway down")
+        self.topics_created.append((conversation_id, source_message_id))
+        return {
+            "conversation": {"id": "topic-conv-9", "type": "topic", "name": "话题"},
+            "parent_conversation_id": conversation_id,
+            "source_message_id": source_message_id,
+            "created": True,
+            "archived": False,
+        }
+
     async def send_status(self, conversation_id, status):
         self.statuses.append(status)
+
+
+def long_analysis_fn(request):
+    """~50KB of report body: past the topic threshold and past the inline cap."""
+    return AnalysisOutcome(
+        ticker=request.ticker,
+        trade_date=request.trade_date,
+        asset_type=request.asset_type,
+        signal="Hold",
+        final_state={"market_report": "M" * 50_000},
+    )
 
 
 def message_event(
@@ -205,6 +232,67 @@ class TestHelpAndErrors:
 
         asyncio.run(scenario())
 
+    def test_status_command_replies_without_llm(self):
+        async def must_not_be_called(text):
+            raise AssertionError("parser must not run for /status")
+
+        async def scenario():
+            client = FakeClient()
+            client.connected = True
+            service = make_service(client, parse_fn=must_not_be_called)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=110, text="/status"))
+            await drain(service)
+            worker.cancel()
+
+            content = client.sent[0]["content"]
+            assert "服务状态" in content
+            assert "provider" in content
+            assert "已连接" in content
+            assert client.acked == [110]
+
+        asyncio.run(scenario())
+
+    def test_help_command_replies_without_llm(self):
+        async def must_not_be_called(text):
+            raise AssertionError("parser must not run for /help")
+
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client, parse_fn=must_not_be_called)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=111, text="/help"))
+            await drain(service)
+            worker.cancel()
+
+            assert client.sent[0]["content"] == HELP_TEXT
+            assert client.acked == [111]
+
+        asyncio.run(scenario())
+
+    def test_parse_exception_replies_error_summary_not_help(self):
+        async def parse_fn(text):
+            raise RuntimeError("LLM endpoint unreachable")
+
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client, parse_fn=parse_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=112, text="分析一下洲际油气"))
+            await drain(service)
+            worker.cancel()
+
+            content = client.sent[0]["content"]
+            assert "解析失败" in content
+            assert "LLM endpoint unreachable" in content
+            assert content != HELP_TEXT
+            assert client.acked == [112]
+
+        asyncio.run(scenario())
+
     def test_analysis_failure_replies_error_and_acks(self):
         def analysis_fn(request):
             raise RuntimeError("data vendor down")
@@ -255,6 +343,112 @@ class TestHelpAndErrors:
             assert len(client.sent) == 1
             assert client.acked == []
             assert 105 not in service._processed_cursors
+
+        asyncio.run(scenario())
+
+
+class TestTopicDelivery:
+    def test_long_report_goes_to_topic_with_summary_in_main_chat(self):
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client, analysis_fn=long_analysis_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=120))
+            await drain(service)
+            worker.cancel()
+
+            # Topic created from the user's request message.
+            assert client.topics_created == [("conv-1", "msg-1")]
+            # Full report parts land in the topic conversation.
+            topic_parts = [m for m in client.sent if m["conversation_id"] == "topic-conv-9"]
+            assert len(topic_parts) > 6
+            assert all("M" in m["content"] for m in topic_parts)
+            # Main chat receives only the headline summary + pointer.
+            main = [m for m in client.sent if m["conversation_id"] == "conv-1"]
+            assert len(main) == 1
+            assert "话题" in main[0]["content"]
+            assert "Hold" in main[0]["content"]
+            assert "完整报告共" in main[0]["content"]
+            assert client.acked == [120]
+
+        asyncio.run(scenario())
+
+    def test_short_report_stays_inline(self):
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client)  # default small analysis
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=121))
+            await drain(service)
+            worker.cancel()
+
+            assert client.topics_created == []
+            assert all(m["conversation_id"] == "conv-1" for m in client.sent)
+            assert client.acked == [121]
+
+        asyncio.run(scenario())
+
+    def test_topic_delivery_disabled_caps_inline(self):
+        config = JiyingConfig(
+            ws_url=CONFIG.ws_url,
+            app_id=CONFIG.app_id,
+            app_secret=CONFIG.app_secret,
+            topic_delivery=False,
+        )
+
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client, analysis_fn=long_analysis_fn, config=config)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=122))
+            await drain(service)
+            worker.cancel()
+
+            assert client.topics_created == []
+            assert len(client.sent) == config.max_report_messages
+            assert "截断" in client.sent[-1]["content"]
+            assert client.acked == [122]
+
+        asyncio.run(scenario())
+
+    def test_already_in_topic_gets_full_inline_report(self):
+        async def scenario():
+            client = FakeClient()
+            service = make_service(client, analysis_fn=long_analysis_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(
+                message_event(cursor=123, conversation_id="topic-conv-1",
+                              conversation_type="topic")
+            )
+            await drain(service)
+            worker.cancel()
+
+            assert client.topics_created == []  # never nest topics
+            inline = [m for m in client.sent if m["conversation_id"] == "topic-conv-1"]
+            assert len(inline) > 6  # high cap, no truncation
+            assert client.acked == [123]
+
+        asyncio.run(scenario())
+
+    def test_topic_creation_failure_falls_back_inline(self):
+        async def scenario():
+            client = FakeClient()
+            client.fail_create_topic = True
+            service = make_service(client, analysis_fn=long_analysis_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=124))
+            await drain(service)
+            worker.cancel()
+
+            assert client.topics_created == []
+            # Fallback keeps the high cap instead of truncating.
+            assert len(client.sent) > 6
+            assert client.acked == [124]
 
         asyncio.run(scenario())
 

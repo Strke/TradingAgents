@@ -10,6 +10,8 @@ differ from the broker / TradingView / MT5 style symbols users often type:
     EURUSD            EURUSD=X          spot forex pairs take a ``=X`` suffix
     BTCUSD            BTC-USD           crypto pairs use a ``-`` separator
     SPX500, US500     ^GSPC             index CFDs map to Yahoo index symbols
+    600759            600759.SS         bare A-share codes take an exchange
+                                        suffix (.SS/.SZ/.BJ)
 
 Passing the raw broker symbol to Yahoo returns an empty result, which the
 agents previously received as free text and could hallucinate a price
@@ -79,6 +81,30 @@ _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 # match before the ``USD`` substring.
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 
+# Bare six-digit numeric codes are Chinese A-share board codes (e.g. 600519
+# Kweichow Moutai, 000001 Ping An Bank, 300750 CATL, 832566 BSE). Yahoo needs
+# the exchange suffix. Other six-digit markets (Korea: 005930.KS) must be
+# entered with an explicit suffix and are intentionally left untouched.
+_ASHARE_SSE_PREFIXES = ("60", "68", "900")       # SH main board / STAR / B-share
+_ASHARE_SZSE_PREFIXES = ("00", "30", "200")      # SZ main board / ChiNext / B-share
+_ASHARE_BSE_PREFIXES = ("43", "83", "87", "88", "920")  # Beijing Stock Exchange
+
+
+def ashare_suffix(code: str) -> str | None:
+    """Return the Yahoo exchange suffix for a bare 6-digit Chinese A-share
+    code (``600759`` -> ``.SS``), or ``None`` when the code is not a
+    recognizable A-share board number. Purely syntactic.
+    """
+    if len(code) != 6 or not code.isdigit():
+        return None
+    if code.startswith(_ASHARE_SSE_PREFIXES):
+        return ".SS"
+    if code.startswith(_ASHARE_SZSE_PREFIXES):
+        return ".SZ"
+    if code.startswith(_ASHARE_BSE_PREFIXES):
+        return ".BJ"
+    return None
+
 
 def crypto_base(raw: str) -> str | None:
     """Return the crypto base (e.g. ``BTC``) for a known USD/USDT/USDC-quoted
@@ -108,8 +134,10 @@ def normalize_symbol(raw: str) -> str:
       1. Explicit alias table (metals, energy, index CFDs).
       2. Crypto rule: a known crypto base quoted in USD/USDT/USDC (dashed or
          not) -> ``BASE-USD``.
-      3. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
-      4. Otherwise the upper-cased symbol is returned unchanged (plain
+      3. A-share rule: a bare six-digit Chinese board code (``600759``) gets
+         its exchange suffix (``.SS``/``.SZ``/``.BJ``).
+      4. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
+      5. Otherwise the upper-cased symbol is returned unchanged (plain
          equities, ETFs, Yahoo-native symbols like ``GC=F`` or ``^GSPC``).
 
     A trailing ``+`` (broker CFD marker, e.g. ``XAUUSD+``) is stripped before
@@ -128,6 +156,8 @@ def normalize_symbol(raw: str) -> str:
         canonical = _ALIASES[s]
     elif crypto is not None:
         canonical = crypto
+    elif (suffix := ashare_suffix(s)) is not None:
+        canonical = f"{s}{suffix}"
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
         canonical = f"{s}=X"
     else:

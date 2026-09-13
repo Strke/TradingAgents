@@ -21,16 +21,23 @@ import asyncio
 import contextlib
 import logging
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 
 from tradingagents.agents.utils.rating import is_review
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 from .config import JiyingConfig
-from .parser import HELP_TEXT, AnalysisRequest, parse_request
+from .parser import (
+    HELP_TEXT,
+    AnalysisRequest,
+    is_help_command,
+    is_status_command,
+    parse_request,
+)
 from .protocol import Envelope
-from .report import AnalysisOutcome, format_report
+from .report import AnalysisOutcome, build_headline, count_chunks, format_report
 from .ws_client import JiyingClient
 
 logger = logging.getLogger(__name__)
@@ -68,6 +75,7 @@ class JiyingService:
         self._graph: TradingAgentsGraph | None = None
         self._graph_lock = threading.Lock()
         self._worker_task: asyncio.Task | None = None
+        self._started_monotonic = time.monotonic()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -156,14 +164,33 @@ class JiyingService:
         cursor = job.envelope.cursor
         assert cursor is not None
 
-        try:
-            request = await self._parse(job.text)
-        except Exception:
-            logger.exception("Failed to parse message (cursor %s)", cursor)
+        # Local commands (no LLM round-trip).
+        if is_status_command(job.text):
+            await self._safe_send_text(job, self._status_text(), ack=True)
+            return
+        if is_help_command(job.text):
             await self._safe_send_text(job, HELP_TEXT, ack=True)
             return
 
+        try:
+            request = await self._parse(job.text)
+        except Exception as exc:
+            logger.exception("Failed to parse message (cursor %s)", cursor)
+            summary = f"{type(exc).__name__}: {exc}"
+            await self._safe_send_text(
+                job,
+                f"消息解析失败：`{summary[:300]}`\n\n"
+                "通常是 LLM 配置问题，请检查 provider / API key / 模型名；"
+                "发送 /help 查看用法，发送 /status 查看当前配置。",
+                ack=True,
+            )
+            return
+
         if request is None:
+            logger.warning(
+                "Message contained no analysis target (cursor %s): %r",
+                cursor, job.text[:100],
+            )
             await self._safe_send_text(job, HELP_TEXT, ack=True)
             return
 
@@ -194,24 +221,112 @@ class JiyingService:
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
 
-        messages = format_report(
-            outcome,
-            chunk_chars=self._config.report_chunk_chars,
-            max_messages=self._config.max_report_messages,
-        )
-        for content in messages:
-            await self._send(job, content)
+        await self._deliver_report(job, outcome)
 
         await self._client.ack(cursor)
         self._processed_cursors.add(cursor)
-        logger.info(
-            "Delivered %d-part report for %s (cursor %s)",
-            len(messages), request.label, cursor,
-        )
+        logger.info("Report delivered for %s (cursor %s)", request.label, cursor)
 
     # ------------------------------------------------------------------ #
     # Pieces
     # ------------------------------------------------------------------ #
+
+    async def _deliver_report(self, job: _Job, outcome: AnalysisOutcome) -> None:
+        """Deliver the report inline, or into a topic when it is long.
+
+        Long reports would flood the main conversation (and hit the message
+        cap), so when topic delivery is enabled they are posted into a topic
+        created from the user's request message (doc 4.8); the main chat only
+        receives the headline summary plus a pointer. Already-topic
+        conversations get the full report inline with the higher cap.
+        """
+        total_chunks = count_chunks(
+            outcome, chunk_chars=self._config.report_chunk_chars
+        )
+        use_topic = (
+            self._config.topic_delivery
+            and job.conversation_type != "topic"
+            and total_chunks > self._config.topic_threshold_messages
+        )
+
+        if job.conversation_type == "topic" or use_topic:
+            cap = self._config.topic_max_messages
+        else:
+            cap = self._config.max_report_messages
+        messages = format_report(
+            outcome, chunk_chars=self._config.report_chunk_chars, max_messages=cap
+        )
+
+        if use_topic:
+            topic_job = await self._open_topic(job)
+            if topic_job is not None:
+                for content in messages:
+                    await self._send(topic_job, content)
+                summary = (
+                    f"{build_headline(outcome)}\n\n"
+                    f"> ℹ️ 完整报告共 {len(messages)} 个部分，已发布到由你的消息"
+                    "创建的话题中，请在该话题内查看。"
+                )
+                await self._send(job, summary)
+                logger.info(
+                    "Delivered %d-part report to topic for %s (cursor %s)",
+                    len(messages), outcome.ticker, job.envelope.cursor,
+                )
+                return
+            # Topic creation failed: keep the high cap and fall through to
+            # inline delivery rather than truncating the report.
+            logger.warning(
+                "Topic creation failed (cursor %s); delivering inline",
+                job.envelope.cursor,
+            )
+
+        for content in messages:
+            await self._send(job, content)
+        logger.info(
+            "Delivered %d-part report inline for %s (cursor %s)",
+            len(messages), outcome.ticker, job.envelope.cursor,
+        )
+
+    async def _open_topic(self, job: _Job) -> _Job | None:
+        """Create (or reuse) the report topic; returns a retargeted job."""
+        if not job.message_id:
+            logger.warning("No source message id; cannot create topic")
+            return None
+        try:
+            response = await self._client.create_topic(
+                job.conversation_id, job.message_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create topic (cursor %s)", job.envelope.cursor
+            )
+            return None
+        topic_conversation = (response or {}).get("conversation") or {}
+        topic_id = str(topic_conversation.get("id") or "")
+        if not topic_id:
+            logger.warning("Topic creation returned no conversation id")
+            return None
+        return replace(job, conversation_id=topic_id)
+
+    def _status_text(self) -> str:
+        config = self._graph_config or DEFAULT_CONFIG
+        uptime = int(time.monotonic() - self._started_monotonic)
+        hours, remainder = divmod(uptime, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_label = f"{hours}h{minutes}m{seconds}s" if hours else f"{minutes}m{seconds}s"
+        backend = config.get("backend_url") or "（provider 默认端点）"
+        return (
+            "**TradingAgents 服务状态**\n\n"
+            f"- 网关连接：{'✅ 已连接' if self._client.connected else '❌ 未连接'}\n"
+            f"- LLM provider：`{config.get('llm_provider')}`\n"
+            f"- 深度模型：`{config.get('deep_think_llm')}`\n"
+            f"- 快速模型：`{config.get('quick_think_llm')}`\n"
+            f"- 端点：`{backend}`\n"
+            f"- 队列：当前 {self._queue.qsize()} 个待处理"
+            f"（容量 {self._config.queue_size}）\n"
+            f"- 已处理事件：{len(self._processed_cursors)}\n"
+            f"- 运行时长：{uptime_label}\n"
+        )
 
     async def _parse(self, text: str) -> AnalysisRequest | None:
         if self._parse_fn is not None:

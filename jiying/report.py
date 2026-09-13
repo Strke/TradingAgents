@@ -144,6 +144,18 @@ def _split_chunk(text: str, limit: int) -> list[str]:
     return pieces
 
 
+def count_chunks(outcome: AnalysisOutcome, *, chunk_chars: int) -> int:
+    """How many messages the full report would need at ``chunk_chars``.
+
+    Used by the service to decide between inline and topic delivery before
+    committing to a message-count cap.
+    """
+    if chunk_chars <= 0:
+        raise ValueError("chunk_chars must be positive")
+    document = "\n\n".join([build_headline(outcome), *build_sections(outcome)])
+    return len(_split_chunk(document, chunk_chars))
+
+
 def format_report(outcome: AnalysisOutcome, *, chunk_chars: int, max_messages: int) -> list[str]:
     """Render the outcome as a list of markdown message bodies.
 

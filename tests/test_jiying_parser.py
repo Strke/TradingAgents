@@ -11,6 +11,7 @@ from jiying.parser import (
     ParseError,
     extract_json_object,
     is_help_command,
+    is_status_command,
     parse_fast_path,
     parse_request,
     request_from_payload,
@@ -44,6 +45,13 @@ class TestHelpCommand:
         assert not is_help_command("分析 NVDA")
         assert not is_help_command("/analyze NVDA")
 
+    def test_status_command_variants(self):
+        assert is_status_command("/status")
+        assert is_status_command(" 状态 ")
+        assert is_status_command("服务状态")
+        assert not is_status_command("/help")
+        assert not is_status_command("分析 NVDA")
+
 
 class TestFastPath:
     def test_plain_ticker(self):
@@ -64,6 +72,19 @@ class TestFastPath:
     def test_date_only_rejected(self):
         # A bare date is not a ticker.
         assert parse_fast_path("2026-09-01", TODAY) is None
+
+    def test_ashare_code_gets_exchange_suffix(self):
+        # Bare 6-digit A-share codes normalize through the shared data layer.
+        assert parse_fast_path("600759", TODAY).ticker == "600759.SS"
+        assert parse_fast_path("600759 2026-09-11", TODAY).ticker == "600759.SS"
+        assert parse_fast_path("000001", TODAY).ticker == "000001.SZ"
+        assert parse_fast_path("300750", TODAY).ticker == "300750.SZ"
+
+    def test_already_suffixed_symbols_untouched(self):
+        assert parse_fast_path("600519.SS", TODAY).ticker == "600519.SS"
+        assert parse_fast_path("005930.KS", TODAY).ticker == "005930.KS"
+        assert parse_fast_path("NVDA", TODAY).ticker == "NVDA"
+        assert parse_fast_path("BTC-USD", TODAY).ticker == "BTC-USD"
 
 
 class TestExtractJson:
@@ -111,6 +132,10 @@ class TestRequestFromPayload:
         with pytest.raises(ValueError, match="asset_type"):
             request_from_payload({"ticker": "NVDA", "asset_type": "forex"}, TODAY)
 
+    def test_ashare_ticker_from_llm_gets_suffix(self):
+        request = request_from_payload({"ticker": "600759"}, TODAY)
+        assert request.ticker == "600759.SS"
+
 
 class TestParseRequest:
     def test_natural_language_via_llm(self):
@@ -154,3 +179,7 @@ class TestHelpText:
     def test_help_text_mentions_key_rules(self):
         assert "YYYY-MM-DD" in HELP_TEXT
         assert "crypto" in HELP_TEXT
+        # A-share guidance and the /status command are documented.
+        assert ".SS" in HELP_TEXT
+        assert "/status" in HELP_TEXT
+        assert "005930.KS" in HELP_TEXT

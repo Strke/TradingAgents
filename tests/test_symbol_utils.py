@@ -6,6 +6,7 @@ import pytest
 
 from tradingagents.dataflows.symbol_utils import (
     NoMarketDataError,
+    ashare_suffix,
     crypto_base,
     is_yahoo_safe,
     normalize_symbol,
@@ -51,6 +52,71 @@ class TestNormalizeSymbol(unittest.TestCase):
 
     def test_empty_input_passthrough(self):
         self.assertEqual(normalize_symbol(""), "")
+
+
+@pytest.mark.unit
+class TestAshareSuffix(unittest.TestCase):
+    def test_sse_prefixes(self):
+        # Shanghai main board / STAR market / B-share
+        for raw, expected in (
+            ("600759", "600759.SS"),   # 洲际油气
+            ("600519", "600519.SS"),   # 贵州茅台
+            ("601318", "601318.SS"),
+            ("688981", "688981.SS"),   # STAR market
+            ("900939", "900939.SS"),   # SSE B-share
+        ):
+            self.assertEqual(normalize_symbol(raw), expected)
+
+    def test_szse_prefixes(self):
+        for raw, expected in (
+            ("000001", "000001.SZ"),   # 平安银行
+            ("002594", "002594.SZ"),
+            ("300750", "300750.SZ"),   # ChiNext
+            ("301536", "301536.SZ"),
+            ("200596", "200596.SZ"),   # SZSE B-share
+        ):
+            self.assertEqual(normalize_symbol(raw), expected)
+
+    def test_bse_prefixes(self):
+        for raw, expected in (
+            ("430047", "430047.BJ"),
+            ("832566", "832566.BJ"),
+            ("873223", "873223.BJ"),
+            ("920002", "920002.BJ"),
+        ):
+            self.assertEqual(normalize_symbol(raw), expected)
+
+    def test_unknown_six_digit_untouched(self):
+        # Not a recognizable A-share board number: left as-is (e.g. used by
+        # other six-digit markets via explicit suffixes only).
+        self.assertEqual(normalize_symbol("123456"), "123456")
+        self.assertEqual(normalize_symbol("987654"), "987654")
+
+    def test_suffixed_or_non_numeric_untouched(self):
+        # Already-canonical and other-market symbols must not be mangled.
+        for raw in (
+            "600519.SS",
+            "000001.SZ",
+            "005930.KS",   # Samsung (Korea) requires the explicit suffix
+            "AAPL",
+            "12345",
+            "1234567",
+        ):
+            self.assertEqual(normalize_symbol(raw), raw)
+
+    def test_korean_style_bare_code_collides_with_szse_by_design(self):
+        # Known trade-off: bare six-digit codes are assumed A-share, so a
+        # Korean ticker typed without its .KS suffix reads as Shenzhen.
+        # Documented in the jiying help text; explicit suffix wins.
+        self.assertEqual(normalize_symbol("005930"), "005930.SZ")
+        self.assertEqual(normalize_symbol("005930.KS"), "005930.KS")
+
+    def test_helper_returns_none_for_non_ashare(self):
+        self.assertIsNone(ashare_suffix("AAPL"))
+        self.assertIsNone(ashare_suffix("12345"))
+        self.assertIsNone(ashare_suffix("600519.SS"))
+        self.assertIsNone(ashare_suffix(""))
+        self.assertEqual(ashare_suffix("600759"), ".SS")
 
 
 @pytest.mark.unit
