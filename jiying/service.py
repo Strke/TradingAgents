@@ -38,7 +38,7 @@ from .parser import (
 )
 from .protocol import Envelope
 from .report import AnalysisOutcome, build_headline, count_chunks, format_report
-from .ws_client import JiyingClient
+from .ws_client import JiyingClient, RequestError
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,29 @@ class JiyingService:
             job = await self._queue.get()
             try:
                 await self._handle_job(job)
+            except RequestError as exc:
+                if exc.is_permanent:
+                    # Retrying identical input can never succeed (doc 2.4):
+                    # notify the user and ACK so the event stops replaying
+                    # (each replay would re-run a full, costly analysis).
+                    logger.exception(
+                        "Permanent RPC failure for cursor %s; acknowledging "
+                        "after error notice", job.envelope.cursor,
+                    )
+                    await self._safe_send_text(
+                        job,
+                        f"报告投递失败（`{exc.code}`）：`{str(exc)[:300]}`\n\n"
+                        "该消息已跳过，不会自动重试；请调整后重新发起分析。",
+                        ack=True,
+                    )
+                else:
+                    # Transient (timeouts, connection loss, internal_error):
+                    # do NOT ack, so the platform replays this event after
+                    # reconnect and no report is silently lost.
+                    logger.exception(
+                        "Transient RPC failure for cursor %s; leaving "
+                        "un-ACKed for replay", job.envelope.cursor,
+                    )
             except Exception:
                 # Unexpected (usually connection) failure: do NOT ack, so the
                 # platform replays this event after reconnect and no report
@@ -288,7 +311,12 @@ class JiyingService:
         )
 
     async def _open_topic(self, job: _Job) -> _Job | None:
-        """Create (or reuse) the report topic; returns a retargeted job."""
+        """Create (or reuse) the report topic; returns a retargeted job.
+
+        The retargeted job drops the source ``message_id``: reply references
+        must point at messages inside the *target* conversation (doc 4.3), and
+        the source message lives in the parent conversation, not the topic.
+        """
         if not job.message_id:
             logger.warning("No source message id; cannot create topic")
             return None
@@ -306,7 +334,7 @@ class JiyingService:
         if not topic_id:
             logger.warning("Topic creation returned no conversation id")
             return None
-        return replace(job, conversation_id=topic_id)
+        return replace(job, conversation_id=topic_id, message_id="")
 
     def _status_text(self) -> str:
         config = self._graph_config or DEFAULT_CONFIG

@@ -39,12 +39,31 @@ class NotConnectedError(RuntimeError):
     """Raised when an RPC is attempted while the session is down."""
 
 
+# Error codes the platform documents as non-retryable (doc 2.4): retrying the
+# identical request cannot succeed, so the service should surface the failure
+# and ACK the event instead of letting it replay forever.
+PERMANENT_RPC_CODES = frozenset(
+    {
+        "invalid_request",       # parameter error; fix input, don't resubmit
+        "forbidden",             # no permission; don't retry
+        "not_found",             # target gone or invisible
+        "request_id_conflict",   # id reused with different content
+        "response_too_large",    # shrink the payload, don't resend as-is
+    }
+)
+
+
 class RequestError(RuntimeError):
     """Raised when the server answers an RPC with an error envelope."""
 
     def __init__(self, code: str | None, message: str):
         self.code = code
         super().__init__(f"JiYing RPC failed ({code}): {message}")
+
+    @property
+    def is_permanent(self) -> bool:
+        """Whether retrying this error can ever succeed (doc 2.4)."""
+        return self.code in PERMANENT_RPC_CODES
 
 
 class RequestTimeoutError(RuntimeError):

@@ -15,6 +15,7 @@ from jiying.parser import HELP_TEXT, AnalysisRequest
 from jiying.protocol import parse_envelope
 from jiying.report import AnalysisOutcome
 from jiying.service import JiyingService
+from jiying.ws_client import PERMANENT_RPC_CODES, RequestError
 
 pytestmark = pytest.mark.unit
 
@@ -360,16 +361,22 @@ class TestTopicDelivery:
 
             # Topic created from the user's request message.
             assert client.topics_created == [("conv-1", "msg-1")]
-            # Full report parts land in the topic conversation.
+            # Full report parts land in the topic conversation. They must NOT
+            # carry a reply reference: the source message belongs to the
+            # parent conversation, and cross-conversation quotes are rejected
+            # by the server (invalid_request: 引用消息无效).
             topic_parts = [m for m in client.sent if m["conversation_id"] == "topic-conv-9"]
             assert len(topic_parts) > 6
             assert all("M" in m["content"] for m in topic_parts)
-            # Main chat receives only the headline summary + pointer.
+            assert all(m["reply_to"] is None for m in topic_parts)
+            # Main chat receives only the headline summary + pointer, still
+            # replying to the user's request message.
             main = [m for m in client.sent if m["conversation_id"] == "conv-1"]
             assert len(main) == 1
             assert "话题" in main[0]["content"]
             assert "Hold" in main[0]["content"]
             assert "完整报告共" in main[0]["content"]
+            assert main[0]["reply_to"] == "msg-1"
             assert client.acked == [120]
 
         asyncio.run(scenario())
@@ -451,6 +458,82 @@ class TestTopicDelivery:
             assert client.acked == [124]
 
         asyncio.run(scenario())
+
+
+class TestPermanentVsTransientFailures:
+    """Doc 2.4: permanent RPC errors must not replay; transient ones must."""
+
+    def test_permanent_rpc_error_notifies_and_acks(self):
+        class TopicSendRejects(FakeClient):
+            async def send_message(
+                self, target_type, conversation_id, message, *,
+                reply_to_message_id=None,
+            ):
+                if conversation_id == "topic-conv-9":
+                    raise RequestError("invalid_request", "引用消息无效")
+                return await super().send_message(
+                    target_type, conversation_id, message,
+                    reply_to_message_id=reply_to_message_id,
+                )
+
+        async def scenario():
+            client = TopicSendRejects()
+            service = make_service(client, analysis_fn=long_analysis_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=130))
+            await drain(service)
+            worker.cancel()
+
+            notice = [m for m in client.sent if "投递失败" in m["content"]]
+            assert len(notice) == 1
+            assert "invalid_request" in notice[0]["content"]
+            assert "引用消息无效" in notice[0]["content"]
+            # ACKed so the platform stops replaying (no repeated analyses).
+            assert client.acked == [130]
+            assert 130 in service._processed_cursors
+
+        asyncio.run(scenario())
+
+    def test_transient_rpc_error_leaves_unacked_for_replay(self):
+        class TopicSendDrops(FakeClient):
+            async def send_message(
+                self, target_type, conversation_id, message, *,
+                reply_to_message_id=None,
+            ):
+                if conversation_id == "topic-conv-9":
+                    raise ConnectionError("gateway down")
+                return await super().send_message(
+                    target_type, conversation_id, message,
+                    reply_to_message_id=reply_to_message_id,
+                )
+
+        async def scenario():
+            client = TopicSendDrops()
+            service = make_service(client, analysis_fn=long_analysis_fn)
+            worker = asyncio.create_task(service._worker())
+
+            await service._on_event(message_event(cursor=131))
+            await drain(service)
+            worker.cancel()
+
+            assert client.acked == []
+            assert 131 not in service._processed_cursors
+            # No error notice either: the event will replay and retry.
+            assert all("投递失败" not in m["content"] for m in client.sent)
+
+        asyncio.run(scenario())
+
+    def test_error_code_classification(self):
+        assert RequestError("invalid_request", "x").is_permanent
+        assert RequestError("forbidden", "x").is_permanent
+        assert RequestError("not_found", "x").is_permanent
+        assert not RequestError("internal_error", "x").is_permanent
+        assert not RequestError(None, "x").is_permanent
+        assert {
+            "invalid_request", "forbidden", "not_found",
+            "request_id_conflict", "response_too_large",
+        } >= PERMANENT_RPC_CODES
 
 
 class TestQueue:

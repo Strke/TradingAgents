@@ -34,7 +34,17 @@ def main() -> int:
         return 1
 
     service = JiyingService(config)
-    logger.info("Starting JiYing bridge service")
+    logger.info(
+        "Starting JiYing bridge service (topic_delivery=%s, "
+        "topic_threshold=%d, topic_max_messages=%d, inline_max_messages=%d, "
+        "chunk_chars=%d, queue_size=%d)",
+        config.topic_delivery,
+        config.topic_threshold_messages,
+        config.topic_max_messages,
+        config.max_report_messages,
+        config.report_chunk_chars,
+        config.queue_size,
+    )
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(service.run())
     return 0
