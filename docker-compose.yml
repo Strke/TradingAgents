@@ -8,6 +8,18 @@ services:
     tty: true
     stdin_open: true
 
+  # JiYing (即应) bridge: standalone WebSocket service that receives chat
+  # messages, runs TradingAgents, and replies with the full report.
+  # Requires JIYING_WS_URL / JIYING_APP_ID / JIYING_APP_SECRET in .env.
+  jiying-agent:
+    build: .
+    entrypoint: ["python", "-m", "jiying"]
+    env_file:
+      - .env
+    volumes:
+      - tradingagents_data:/home/appuser/.tradingagents
+    restart: unless-stopped
+
   ollama:
     image: ollama/ollama:latest
     volumes:
@@ -28,6 +40,23 @@ services:
       - ollama
     tty: true
     stdin_open: true
+    profiles:
+      - ollama
+
+  # JiYing bridge variant backed by the local Ollama instance.
+  jiying-agent-ollama:
+    build: .
+    entrypoint: ["python", "-m", "jiying"]
+    env_file:
+      - .env
+    environment:
+      - TRADINGAGENTS_LLM_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+    volumes:
+      - tradingagents_data:/home/appuser/.tradingagents
+    depends_on:
+      - ollama
+    restart: unless-stopped
     profiles:
       - ollama
 

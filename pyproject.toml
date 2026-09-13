@@ -30,6 +30,7 @@ dependencies = [
     "stockstats>=0.6.5",
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
+    "websockets>=14.0",
     "yfinance>=1.4.1",
 ]
 
@@ -49,7 +50,7 @@ bedrock = [
 tradingagents = "cli.main:app"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "jiying*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
